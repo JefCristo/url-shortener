@@ -20,7 +20,7 @@ Base = declarative_base()
 class URL(Base):
     __tablename__ = "urls"
     id = Column(Integer, primary_key=True, index=True)
-    short_code = Column(String(10), unique=True, index=True, nullable=False)
+    short_code = Column(String(50), unique=True, index=True, nullable=False)  # Increased for custom codes
     long_url = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     clicks = Column(Integer, default=0)
@@ -47,7 +47,7 @@ def generate_short_code(length=6):
     chars = string.ascii_letters + string.digits
     return ''.join(random.choices(chars, k=length))
 
-# ========== WEB INTERFACE (with external CSS) ==========
+# ========== WEB INTERFACE (with external CSS and custom code support) ==========
 @app.get("/", response_class=HTMLResponse)
 def web_interface():
     html = """<!DOCTYPE html>
@@ -68,6 +68,12 @@ def web_interface():
             <input type="url" id="longUrl" placeholder="https://example.com/very/long/url" autocomplete="off">
         </div>
 
+        <div class="input-group">
+            <label for="customCode">Custom short code (optional):</label>
+            <input type="text" id="customCode" placeholder="e.g., mylink (letters and numbers only)" autocomplete="off">
+            <small style="color: #666; display: block; margin-top: 5px;">Leave blank for random code</small>
+        </div>
+
         <button onclick="shortenUrl()">✨ Shorten URL</button>
         <div id="result" class="result"></div>
         <div class="footer">⚡ Powered by FastAPI, Redis & PostgreSQL</div>
@@ -77,6 +83,7 @@ def web_interface():
         async function shortenUrl() {
             const longUrlInput = document.getElementById('longUrl');
             const longUrl = longUrlInput.value.trim();
+            const customCode = document.getElementById('customCode').value.trim();
             const resultDiv = document.getElementById('result');
             
             resultDiv.innerHTML = '';
@@ -91,7 +98,11 @@ def web_interface():
             resultDiv.classList.add('show');
             
             try {
-                const response = await fetch(`/shorten?long_url=${encodeURIComponent(longUrl)}`);
+                let url = `/shorten?long_url=${encodeURIComponent(longUrl)}`;
+                if (customCode) {
+                    url += `&custom_code=${encodeURIComponent(customCode)}`;
+                }
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 if (!response.ok) throw new Error(data.detail || 'Something went wrong');
@@ -111,6 +122,7 @@ def web_interface():
                     </div>
                 `;
                 longUrlInput.value = '';
+                document.getElementById('customCode').value = '';
             } catch (error) {
                 showError(error.message);
             }
@@ -131,6 +143,9 @@ def web_interface():
         document.getElementById('longUrl').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') shortenUrl();
         });
+        document.getElementById('customCode').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') shortenUrl();
+        });
     </script>
 </body>
 </html>"""
@@ -138,15 +153,34 @@ def web_interface():
 
 # ========== API ENDPOINTS ==========
 @app.api_route("/shorten", methods=["GET", "POST"])
-def shorten_url(long_url: str, db: Session = Depends(get_db)):
+def shorten_url(long_url: str, custom_code: str = None, db: Session = Depends(get_db)):
+    # Auto-add https:// if missing
     if not long_url.startswith(("http://", "https://")):
         long_url = "https://" + long_url
-    short_code = generate_short_code()
+    
+    # Use custom code if provided, otherwise generate random
+    if custom_code:
+        # Validate custom code (only letters and numbers)
+        if not custom_code.isalnum():
+            raise HTTPException(status_code=400, detail="Custom code must contain only letters and numbers")
+        
+        # Check if custom code already exists
+        existing = db.query(URL).filter(URL.short_code == custom_code).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Custom code already taken. Choose another.")
+        short_code = custom_code
+    else:
+        short_code = generate_short_code()
+    
+    # Save to database
     new_url = URL(short_code=short_code, long_url=long_url)
     db.add(new_url)
     db.commit()
     db.refresh(new_url)
+    
+    # Cache in Redis
     redis_client.setex(f"url:{short_code}", 3600, long_url)
+    
     return {
         "short_code": short_code,
         "short_url": f"http://localhost:8000/{short_code}",
