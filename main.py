@@ -20,8 +20,10 @@ IS_PRODUCTION = os.environ.get("RENDER", False) or os.environ.get("RAILWAY", Fal
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost/url_shortener")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
+# Determine BASE_URL for QR codes and short URLs
 if IS_PRODUCTION:
-    BASE_URL = os.environ.get("BASE_URL", "https://your-app.onrender.com")
+    # In production, use the environment variable or auto-detect from Render
+    BASE_URL = os.environ.get("BASE_URL", "https://url-shortener-5r6c.onrender.com")
 else:
     def get_local_ip():
         try:
@@ -84,6 +86,28 @@ def create_unique_random_code(db: Session, length=6, max_attempts=5):
         if not db.query(URL).filter(URL.short_code == code).first():
             return code
     return create_unique_random_code(db, length + 1, max_attempts)
+
+# ========== HELPER FUNCTION TO FIX OLD URLs ==========
+def fix_localhost_url(long_url: str) -> str:
+    """If a long_url contains localhost or local IP, replace with production URL"""
+    if not IS_PRODUCTION:
+        return long_url
+    
+    # List of local patterns to replace
+    local_patterns = [
+        "http://localhost:8000/",
+        "http://127.0.0.1:8000/",
+        "http://192.168.",
+    ]
+    
+    for pattern in local_patterns:
+        if pattern in long_url:
+            # Extract the short code from the local URL
+            short_code = long_url.split("/")[-1]
+            # Return the correct production URL
+            return f"{BASE_URL}/{short_code}"
+    
+    return long_url
 
 # ========== WEB INTERFACE ==========
 @app.get("/", response_class=HTMLResponse)
@@ -249,9 +273,11 @@ def web_interface():
 # ========== API ENDPOINTS ==========
 @app.api_route("/shorten", methods=["GET", "POST"])
 def shorten_url(long_url: str, custom_code: str = None, db: Session = Depends(get_db)):
+    # Auto-add https://
     if not long_url.startswith(("http://", "https://")):
         long_url = "https://" + long_url
 
+    # Handle custom code
     if custom_code:
         if not custom_code.isalnum():
             raise HTTPException(status_code=400, detail="Custom code must contain only letters and numbers")
@@ -264,6 +290,7 @@ def shorten_url(long_url: str, custom_code: str = None, db: Session = Depends(ge
     else:
         short_code = create_unique_random_code(db)
 
+    # Create and save
     new_url = URL(short_code=short_code, long_url=long_url)
     try:
         db.add(new_url)
@@ -280,9 +307,11 @@ def shorten_url(long_url: str, custom_code: str = None, db: Session = Depends(ge
         else:
             raise HTTPException(status_code=409, detail="Conflict. Try a different custom code.")
 
+    # Cache in Redis
     if redis_client:
         redis_client.setex(f"url:{short_code}", 3600, long_url)
 
+    # Use BASE_URL for the short URL response
     return {
         "short_code": short_code,
         "short_url": f"{BASE_URL}/{short_code}",
@@ -291,20 +320,29 @@ def shorten_url(long_url: str, custom_code: str = None, db: Session = Depends(ge
 
 @app.get("/{short_code}")
 def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
+    # Try Redis cache first
     long_url = None
     if redis_client:
         long_url = redis_client.get(f"url:{short_code}")
     
     if not long_url:
+        # Check database
         url_entry = db.query(URL).filter(URL.short_code == short_code).first()
         if not url_entry:
             raise HTTPException(status_code=404, detail="URL not found")
         long_url = url_entry.long_url
+        
+        # *** NEW: Fix old localhost URLs on the fly ***
+        long_url = fix_localhost_url(long_url)
+        
+        # Update click count
         url_entry.clicks += 1
         db.commit()
+        # Cache for next time
         if redis_client:
             redis_client.setex(f"url:{short_code}", 3600, long_url)
     else:
+        # Still need to update click count in DB
         url_entry = db.query(URL).filter(URL.short_code == short_code).first()
         if url_entry:
             url_entry.clicks += 1
@@ -319,7 +357,7 @@ def get_stats(short_code: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="URL not found")
     return {
         "short_code": url_entry.short_code,
-        "long_url": url_entry.long_url,
+        "long_url": fix_localhost_url(url_entry.long_url) if url_entry.long_url else url_entry.long_url,
         "clicks": url_entry.clicks,
         "created_at": url_entry.created_at
     }
@@ -341,7 +379,7 @@ def generate_qr(short_code: str, db: Session = Depends(get_db)):
 
 @app.get("/health")
 def health_check():
-    status = {"status": "healthy"}
+    status = {"status": "healthy", "base_url": BASE_URL}
     try:
         db = SessionLocal()
         db.execute("SELECT 1")
@@ -369,5 +407,4 @@ if __name__ == "__main__":
     if IS_PRODUCTION:
         uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
     else:
-        # Use import string for reload to work
         uvicorn.run("main:app", host="127.0.0.1", port=port, reload=True)
